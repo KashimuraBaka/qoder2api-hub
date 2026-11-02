@@ -64,7 +64,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.7.16"
+VERSION = "1.7.17"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -6366,13 +6366,19 @@ _CONV_LOCK = threading.Lock()
 
 
 def _conversation_key_from_history(payload):
-    """无显式会话键时的退化判据：首条 user 消息 + 系统提示 + 模型。"""
+    """会话判据：**最后一条 user 消息** + 系统提示 + 模型（issue #128 后续）。
+
+    为什么不是首条：Codex 全量回放历史，若用首条，整个窗口（可能几小时）永远是
+    同一个 id —— 用量面板里就成了一条超长对话，看不出「这次对话花了多久」。
+    用最后一条 user 消息：同一次对话内（工具步进时）它不变，用户下一次提问才变，
+    正好等于「一次对话 = 一次用户提问 + 后续工具步进」。
+    """
     if not isinstance(payload, dict):
         return ""
     msgs = payload.get("messages")
     if not isinstance(msgs, list):
         return ""
-    first_user = ""
+    last_user = ""
     system = ""
     for m in msgs:
         if not isinstance(m, dict):
@@ -6385,13 +6391,12 @@ def _conversation_key_from_history(payload):
         text = str(content or "")
         if role == "system" and not system:
             system = text[:200]
-        elif role == "user" and not first_user:
-            first_user = text[:400]
-            break
-    if not first_user:
+        elif role == "user":
+            last_user = text[:400]        # 一直覆盖到最后一条
+    if not last_user:
         return ""
-    raw = "\x00".join([str(payload.get("model") or ""), system, first_user])
-    return "hist:" + hashlib.sha1(raw.encode("utf-8")).hexdigest()
+    raw = "\x00".join([str(payload.get("model") or ""), system, last_user])
+    return "turn:" + hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
 def conversation_identity(payload, client_session_key=None):
@@ -6399,7 +6404,14 @@ def conversation_identity(payload, client_session_key=None):
     if not CONVERSATION_SHARE:
         return None
     key = str(client_session_key or "").strip()
-    if not key:
+    if key:
+        # issue #128 后续：窗口级 id 会把几小时的会话并成一条，用量面板看不出
+        # 单次对话时长。这里在显式键后追加「本轮提问」摘要 —— 同一次提问内的
+        # 工具步进仍归同一条，用户下次提问才换 id。
+        _turn = _conversation_key_from_history(payload)
+        if _turn:
+            key = key + "|" + _turn
+    else:
         key = _conversation_key_from_history(payload)
     if not key:
         return None

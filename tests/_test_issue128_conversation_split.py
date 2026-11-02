@@ -20,20 +20,30 @@ print("[#128] 显式会话键：同一会话复用同一身份")
 P._CONVERSATIONS.clear()
 a = P.conversation_identity({"messages": history("A")}, "sess-1")
 b = P.conversation_identity({"messages": history("A")}, "sess-1")
-check("id 相同", a["id"] == b["id"], (a["id"], b["id"]))
+check("同窗口同提问 -> id 相同", a["id"] == b["id"], (a["id"], b["id"]))
 check("begin_at 相同（对话时长连续）", a["begin_at"] == b["begin_at"])
+_next_q = history("A") + [{"role": "assistant", "content": "ok"},
+                          {"role": "user", "content": "再改一处"}]
+a2 = P.conversation_identity({"messages": _next_q}, "sess-1")
+check("同窗口但新提问 -> 新 id（面板能看单次时长）", a["id"] != a2["id"])
 c = P.conversation_identity({"messages": history("A")}, "sess-2")
-check("不同会话 id 不同", a["id"] != c["id"])
+check("不同窗口 id 不同", a["id"] != c["id"])
 
 print("[#128] 无显式键：用首条 user 消息 + 系统提示 + 模型退化")
 P._CONVERSATIONS.clear()
 d1 = P.conversation_identity({"model": "gpt-5", "messages": history("X")})
 d2 = P.conversation_identity({"model": "gpt-5", "messages": history("X")})
 check("同一对话（历史被追加）仍命中同一条", d1["id"] == d2["id"])
-grow = history("X") + [{"role": "user", "content": "继续"},
-                       {"role": "assistant", "content": "ok"}]
-d3 = P.conversation_identity({"model": "gpt-5", "messages": grow})
-check("历史变长不影响归组", d1["id"] == d3["id"])
+# 工具步进（追加 tool/assistant，不追加 user）仍属同一条
+step = history("X") + [{"role": "assistant", "content": ""},
+                      {"role": "tool", "content": "结果"}]
+d3 = P.conversation_identity({"model": "gpt-5", "messages": step})
+check("同一次提问内的工具步进仍归同一条", d1["id"] == d3["id"])
+# 用户再次提问 -> 新一条（#128 后续：按「一次对话」切分，而非整个窗口）
+grow = history("X") + [{"role": "assistant", "content": "ok"},
+                       {"role": "user", "content": "继续"}]
+d3b = P.conversation_identity({"model": "gpt-5", "messages": grow})
+check("用户下一次提问 -> 新会话 id", d1["id"] != d3b["id"])
 d4 = P.conversation_identity({"model": "gpt-5", "messages": history("Y")})
 check("不同对话不合并", d1["id"] != d4["id"])
 d5 = P.conversation_identity({"model": "other-model", "messages": history("X")})
@@ -95,7 +105,9 @@ check("entries 不超过上限", len(P._CONVERSATIONS) <= P._CONV_MAX_ENTRIES,
       len(P._CONVERSATIONS))
 P._CONVERSATIONS.clear()
 k = P.conversation_identity({"messages": history("T")}, "ttl")
-P._CONVERSATIONS["ttl"]["at"] = time.time() - P._CONV_TTL_SECS - 1
+# 会话键现在是「显式键|提问摘要」，直接取唯一那条来改时间
+_only_key = list(P._CONVERSATIONS)[0]
+P._CONVERSATIONS[_only_key]["at"] = time.time() - P._CONV_TTL_SECS - 1
 k2 = P.conversation_identity({"messages": history("T")}, "ttl")
 check("超过 TTL 重新分配（不无限延用旧会话）", k["id"] != k2["id"])
 
