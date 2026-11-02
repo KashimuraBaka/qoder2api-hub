@@ -28,7 +28,7 @@ OpenAI 兼容接口。上游链路：
 import argparse
 import atexit
 import hashlib
-from collections import deque
+from collections import deque, OrderedDict
 import re
 import json
 import os
@@ -64,7 +64,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.7.14"
+VERSION = "1.7.15"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -2420,10 +2420,12 @@ def prefix_session_cache():
 
 
 def assign_prefix_session(body, account, model_key, client_session_key=None,
-                          usage_ctx=None):
+                          usage_ctx=None, fallback_session_id=None):
     """Choose a cache-affine ID only within the selected upstream account."""
     # Always reset: a preceding failed account may already have acquired an ID.
-    body["session_id"] = str(uuid.uuid4())
+    # issue #128：没有前缀缓存命中时用**会话级** id 兜底，保证同一对话的
+    # session_id 稳定（上游用量归组用），而不是每请求一个新 uuid。
+    body["session_id"] = fallback_session_id or str(uuid.uuid4())
     if usage_ctx is not None:
         usage_ctx["session_affinity"] = "random"
     try:
@@ -6050,7 +6052,7 @@ def _keep_toplevel_images():
     return str(os.environ.get("QD_KEEP_TOPLEVEL_IMAGES") or "").strip().lower()         in ("1", "on", "true", "yes")
 
 
-def build_qoder_body(payload, account, model_key, realm=None):
+def build_qoder_body(payload, account, model_key, realm=None, conversation=None):
     """构造 agent_chat_generation 上游请求体（返回 dict，随后 qoder_encode）。
 
     以官方 baseprompt.json 为骨架：每次覆写 request/session id、时间戳、
@@ -6107,7 +6109,10 @@ def build_qoder_body(payload, account, model_key, realm=None):
 
     nid = str(uuid.uuid4())
     body["request_id"] = nid
-    body["chat_record_id"] = nid
+    # issue #128：用量面板的「一条对话」看起来是按 chat_record_id 归组的（官方
+    # 客户端一次对话内该值不变）。同一会话复用会话 id；request_id 仍然每请求
+    # 唯一 —— 计费/限额按请求计数，不能被并掉。
+    body["chat_record_id"] = (conversation or {}).get("id") or nid
     body["request_set_id"] = str(uuid.uuid4())
     body["session_id"] = str(uuid.uuid4())
     body["stream"] = True
@@ -6195,8 +6200,15 @@ def build_qoder_body(payload, account, model_key, realm=None):
 
     # business 会话卡片
     biz = body.get("business") or {}
-    biz["id"] = str(uuid.uuid4())
-    biz["begin_at"] = int(time.time() * 1000)
+    # issue #128：同一次对话复用同一个 id 与 begin_at —— 上游用量面板按它归组，
+    # 每请求一个新 uuid 会把一个 agent 回合拆成几十条「<1min 的对话」，
+    # 日上限（code 110）被迅速刷爆。拿不到会话身份时保持旧行为。
+    if conversation:
+        biz["id"] = conversation["id"]
+        biz["begin_at"] = conversation["begin_at"]
+    else:
+        biz["id"] = str(uuid.uuid4())
+        biz["begin_at"] = int(time.time() * 1000)
     biz["name"] = (prompt[:30] if prompt else "chat")
     biz.setdefault("product", "cli")
     biz.setdefault("type", "agent")
@@ -6314,6 +6326,82 @@ def realm_model_throttled(realm, model):
     if waits and all(w > 0 for w in waits):
         return (True, max(1, int(min(waits))))
     return (False, 0)
+
+
+# ---------------------------------------------------------------------------
+# 上游会话身份（issue #128）
+# ---------------------------------------------------------------------------
+# 官方客户端在一次对话里全程复用同一个 business.id / session_id，因此 Qoder 用量
+# 面板把整段对话算成**一条**；网关此前每个 HTTP 请求都新造 uuid —— 一个 Codex
+# 回合里有几十次工具步进，就被上游记成几十条「<1min 的对话」，日上限（code 110）
+# 很快被刷爆。
+#
+# 策略：同一客户端会话复用同一身份与 begin_at。
+#   1) 客户端显式给了会话键（X-Conversation-Id / session_id / metadata…）就用它；
+#   2) 没给时退化为「首条 user 消息 + 系统提示 + 模型」的摘要 —— Codex 全量回放
+#      历史，首条消息在一次对话里恒定，因此同一对话能稳定命中；
+#   3) 两者都拿不到 -> 保持旧行为（每次新造），绝不把无关请求并成一条。
+# 可用 QD_CONVERSATION_SHARE=0 整体关闭（回到 v1.7.14 行为）。
+CONVERSATION_SHARE = (os.environ.get("QD_CONVERSATION_SHARE") or "1").strip() \
+    not in ("0", "false", "False", "no")
+_CONV_TTL_SECS = float(os.environ.get("QD_CONVERSATION_TTL") or 6 * 3600)
+_CONV_MAX_ENTRIES = 4096
+_CONVERSATIONS = OrderedDict()      # key -> {"id","begin_at","at"}
+_CONV_LOCK = threading.Lock()
+
+
+def _conversation_key_from_history(payload):
+    """无显式会话键时的退化判据：首条 user 消息 + 系统提示 + 模型。"""
+    if not isinstance(payload, dict):
+        return ""
+    msgs = payload.get("messages")
+    if not isinstance(msgs, list):
+        return ""
+    first_user = ""
+    system = ""
+    for m in msgs:
+        if not isinstance(m, dict):
+            continue
+        role = str(m.get("role") or "")
+        content = m.get("content")
+        if isinstance(content, list):
+            content = " ".join(str((p or {}).get("text") or "")
+                                for p in content if isinstance(p, dict))
+        text = str(content or "")
+        if role == "system" and not system:
+            system = text[:200]
+        elif role == "user" and not first_user:
+            first_user = text[:400]
+            break
+    if not first_user:
+        return ""
+    raw = "\x00".join([str(payload.get("model") or ""), system, first_user])
+    return "hist:" + hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def conversation_identity(payload, client_session_key=None):
+    """本请求所属的上游会话身份（issue #128）。返回 {"id","begin_at"} 或 None。"""
+    if not CONVERSATION_SHARE:
+        return None
+    key = str(client_session_key or "").strip()
+    if not key:
+        key = _conversation_key_from_history(payload)
+    if not key:
+        return None
+    now = time.time()
+    with _CONV_LOCK:
+        entry = _CONVERSATIONS.get(key)
+        if entry is not None and now - entry["at"] <= _CONV_TTL_SECS:
+            entry["at"] = now
+            _CONVERSATIONS.move_to_end(key)
+            return {"id": entry["id"], "begin_at": entry["begin_at"]}
+        entry = {"id": str(uuid.uuid4()), "begin_at": int(now * 1000), "at": now}
+        _CONVERSATIONS[key] = entry
+        _CONVERSATIONS.move_to_end(key)
+        while len(_CONVERSATIONS) > _CONV_MAX_ENTRIES:
+            _CONVERSATIONS.popitem(last=False)
+        return {"id": entry["id"], "begin_at": entry["begin_at"]}
+
 
 
 def extract_session_key(headers, payload):
@@ -7565,6 +7653,8 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
     全部账号失败后抛 RateLimited 或最后一个错误。
     """
     model = str(payload.get("model") or "")
+    # issue #128：整段对话复用同一上游会话身份（拿不到就 None = 旧行为）
+    _conv = conversation_identity(payload, session_key)
     if only_account is not None and not target_realm:
         # issue #86：钉死账号时区域跟随该账号（自动路由可能把它换掉）
         target_realm = getattr(only_account, "realm", "") or None
@@ -7584,7 +7674,8 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
     # issue #86：钉死账号时用它构造请求体（身份类字段必须与被测号一致）
     representative = (only_account if only_account is not None
                       else (POOL.pick(realm=realm) if POOL else None))
-    body_obj = build_qoder_body(payload, representative, model_key, realm=realm)
+    body_obj = build_qoder_body(payload, representative, model_key, realm=realm,
+                                  conversation=_conv)
     if usage_ctx is not None:
         # 实际下发档位直接取自请求体（build_qoder_body 只在 norm 非 None 时写入），
         # 与真实出站内容同源，不做二次推算。
@@ -7660,7 +7751,8 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
         # Resolve only after choosing the actual account, before signing.
         assign_prefix_session(body_obj, account, model_key,
                               client_session_key=client_session_key,
-                              usage_ctx=usage_ctx)
+                              usage_ctx=usage_ctx,
+                              fallback_session_id=(_conv or {}).get("id"))
         encoded = qoder_encode(
             json.dumps(body_obj, ensure_ascii=False).encode("utf-8"))
         # 官方候选推理主机（国际版 api1/api2/api3）：传输层失败时切换域名，
