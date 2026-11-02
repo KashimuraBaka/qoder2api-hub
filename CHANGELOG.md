@@ -10,6 +10,25 @@
 - 主版本号只在确有破坏性变更时才动。
 
 
+## v1.7.14
+
+**🐛 问题修复**
+
+- **thinking.budget_tokens 档位单向 clamp**（#126）：`effort_from_anthropic` 的 clamp 只向下取，导致 `medium`（16384）在只支持 `low/high/max` 的模型（`dfmodel` 等）上被压成 **low**，同一语义走 `output_config.effort` 却得到 **high** —— 两条路径结论相反，静默降档。
+  改为**双向就近 + 同距偏模型默认档**，与 `normalize_reasoning_effort` 同一策略；`medium → high`、`ultrathink(31999) → high`、`>32768 → max`。两处实现由测试交叉校验（避免再次分叉）。
+
+**✨ 新增：namespace / MCP 工具不再静默消失**（#127 F1 + F3）
+
+- `type:"namespace"` 容器**递归展开**（`tools` / `children` / `functions`，深度上限 4）成平铺 `function` 条目——容器本身不出站，因此不会触发 #63 的 `unknown variant namespace`；容器内不带 `type` 的子项按 `function` 处理；
+- 回程把 `namespace` 补回 **`response.output_item.added` 那一帧**（客户端按 `(name, namespace, kind)` 匹配执行器，只在 `.done` 补会匹配不到）；
+- `custom_tool_names()` 递归进容器：Codex Desktop 把 `exec` 这类 freeform 工具嵌在 namespace 里，漏掉会让调用以 `function_call` 返回、执行器匹配不到 → 模型无限重试；
+- 合并 `input` 里的 `additional_tools`（Codex Desktop 0.162+ 把整份工具清单放在那里）；
+- 重名策略显式化：**同名只留第一个** + WARN（展平后无法区分两个 server 的同名工具）。
+
+**未做（如实记录）**：#127 的 F2（Codex remote compaction）、F4（`web_search`/`web_fetch` 本地代跑）、F5（`previous_response_id` 提示头）——F2 需要「摘要轮 + 收起工具 + 只发 done 帧」的完整契约，F4 会引入网关主动出网，都按独立特性排期；F5 是可选提示，等维护者确认语义再动。`docs/clients.md` 已同步更新（可用的与仍不支持的写清楚）。
+
+**验证**：新增 `tests/_test_issue126_127_effort_namespace.py`（30 条：档位对照表与两条路径交叉校验、namespace 展开/映射/custom 递归/重名/深度、additional_tools 合并、非流式与流式回程 namespace 逐帧断言）；同时修正 `_test_issue56_62.py` 里按旧单向 clamp 写死的期望（medium → high）。全量 **100 suites / 2631 checks / 0 failed**。
+
 ## v1.7.13
 
 **🐛 问题修复**
