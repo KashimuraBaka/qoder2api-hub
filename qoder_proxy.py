@@ -64,7 +64,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.7.15"
+VERSION = "1.7.16"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -6052,6 +6052,21 @@ def _keep_toplevel_images():
     return str(os.environ.get("QD_KEEP_TOPLEVEL_IMAGES") or "").strip().lower()         in ("1", "on", "true", "yes")
 
 
+def _quota_hint(detail):
+    """上游 detail -> 人话解释（issue #123 后续）。只认已实测过的码。"""
+    d = str(detail or "")
+    if "10605" in d or "isQueued" in d:
+        return ("上游排队中（10605 / RESOURCE_LIMIT）：等 retryAfterSeconds 后会放行，")
+    if "112" in d and ("pricingUrl" in d or "code" in d):
+        return "账号额度耗尽（112 / pricingUrl）：充值或换号，重试无效"
+    if "Billing daily count exceeded" in d or "110" in d:
+        return "当日计费次数上限（110）：次日 0 点重置"
+    if "430" in d:
+        return "客户端/网关版本过低（430）：上游要求升级"
+    if "TOKEN_EXPIRE" in d or "expire" in d.lower():
+        return "凭证过期：需要重新登录该账号"
+    return ""
+
 def build_qoder_body(payload, account, model_key, realm=None, conversation=None):
     """构造 agent_chat_generation 上游请求体（返回 dict，随后 qoder_encode）。
 
@@ -10080,12 +10095,24 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, update_plan_info())
         if path == "/diag/vm":
             # 本机虚拟化检测（看板「签到与福利中心」展示；中文输出）。
-            # 以官方风控桥 runtime-info.exe 的 vmInfo 为准，桥不可用时本机交叉校验。
+            # 以官方风控桥 runtime-info 的 vmInfo 为准，桥不可用时本机交叉校验。
+            # issue #123 后续：把「判定来源」与「桥是否真的可用」一并回显，
+            # 否则用户看到「本地：单板计算机」+「官方风控：KVM」会以为是自相矛盾。
             _q = parse_qs(urlparse(self.path).query)
             try:
-                return self._json(200, local_vm_status(
-                    _q.get("realm", [None])[0] or CURRENT_REALM,
-                    force=bool(_q.get("force", [None])[0])))
+                _realm = _q.get("realm", [None])[0] or CURRENT_REALM
+                _st = local_vm_status(_realm, force=bool(_q.get("force", [None])[0]))
+                _exe = qoder_accounts.runtime_info_exe(_realm)
+                _raw = qoder_accounts.run_runtime_info(_realm) or {}
+                _vmi = _raw.get("vmInfo") if isinstance(_raw.get("vmInfo"), dict) else {}
+                _st["bridge_exe"] = _exe or ""
+                _st["bridge_available"] = bool(_exe)
+                _st["bridge_vm_info"] = {
+                    k: _vmi.get(k) for k in
+                    ("isVm", "brand", "percentage", "vmTypeCode")
+                    if k in _vmi}
+                _st["local_evidence"] = list(_st.get("evidence") or [])
+                return self._json(200, _st)
             except Exception as exc:
                 return self._error(500, "vm status failed: %s" % exc)
         if path == "/health":
@@ -11310,6 +11337,25 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"ok": False, "uid": account.uid,
                                         "status": 429,
                                         "error": "rate limited: %s" % exc.detail[:150],
+                                        "elapsed_ms": wall_ms})
+            except UpstreamStatus as exc:
+                # issue #123 后续：信封层 403/429 以前落到通用分支，只显示
+                # "upstream status 403"，看不到业务码（10605/112/110）——
+                # 把 detail 原样带回面板，并按已知码给出人话解释。
+                wall_ms = int((time.time() - t0) * 1000)
+                _detail = str(getattr(exc, "detail", "") or "")[:400]
+                _hint = _quota_hint(_detail)
+                account.note_error("HTTP %s: %s" % (exc.status, _detail[:80]),
+                                   cooldown=60)
+                log("account test: uid=%s model=%s wall=%dms upstream=%s %s"
+                    % (account.uid[:8], test_model, wall_ms, exc.status,
+                       _hint or _detail[:120]), level="WARN", tag="accounts")
+                return self._json(200, {"ok": False, "uid": account.uid,
+                                        "status": exc.status,
+                                        "error": "upstream HTTP %s: %s"
+                                        % (exc.status, _detail[:200]),
+                                        "detail": _detail,
+                                        "hint": _hint,
                                         "elapsed_ms": wall_ms})
             except urllib.error.HTTPError as exc:
                 wall_ms = int((time.time() - t0) * 1000)

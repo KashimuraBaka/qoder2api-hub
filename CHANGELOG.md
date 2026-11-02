@@ -10,6 +10,20 @@
 - 主版本号只在确有破坏性变更时才动。
 
 
+## v1.7.16
+
+**🔍 诊断增强（#123 后续）**
+
+- **账号「测试」失败不再只显示 `upstream status 403`**：信封层异常现在有专门分支，回包带 `detail`（上游原文，截断 400 字符）与 `hint`（人话解释），日志也带业务码线索。`hint` 覆盖实测过的码：`10605`→上游排队、`112`→额度耗尽、`110`→当日次数上限、`430`→版本过低、`TOKEN_EXPIRE`→凭证过期。
+- **`/diag/vm` 标注判定来源**：新增 `bridge_exe`（找到的 runtime-info 路径，空串=没有）、`bridge_available`、`bridge_vm_info`（只带 `isVm/brand/percentage/vmTypeCode` 四个键）、`local_evidence`（本地交叉校验证据）。
+- **面板把两个来源分开写**：`本地硬件：…` 与 `官方风控：…` 各占一行；桥不可用时明确写「桥不可用（本机未找到 runtime-info），以下为本机交叉校验」——不再把本地结论冒充成官方判定。
+
+**📌 国际版签到（#123 主体的调查结论）**
+
+实测（v1.7.15 + 真实 intl 账号）：`/sash/api/v1/me/daily-check-in/status` 及其 6 个同义变体在 intl 上**全部 404**；活动接口在正确主机 `center.qoder.sh` 上返回 `showCampaign:false / campaigns:[]`；而 `qoder.com` 网页侧同名接口返回 **401 `missing cookie header`**。结论：intl 的每日 100 Credits 走的是**网页会话（cookie）**通道，桌面/CLI 的 COSY token 打不通——这也是网关「暂无可领取」而官方客户端能领的原因。要支持它需要引入浏览器 cookie 这一类凭据，属于新特性，等确认后单独实现。
+
+**验证**：新增 `tests/_test_issue123b_diagnostics.py`（20 条：403 分支/五种业务码 hint/VM 来源字段/面板双来源文案/SBC 判定不回归）；`i18n/en.json` 同步了新的面板文案。全量 **102 suites / 2672 checks / 0 failed**。
+
 ## v1.7.15
 
 **🐛 问题修复：一次对话被上游拆成 N 条（#128）**
