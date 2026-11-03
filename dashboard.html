@@ -4837,6 +4837,32 @@ function effortCell(r){
   return '<span class="badge warn" title="请求 ' + esc(req) + '，实际下发 ' + esc(eff) + '：归一化时被挪档">' + mono(req) + ' → ' + mono(eff) + '</span>';
 }
 
+// issue #129 后续：积分三段拆分单元格（非缓存输入 / 缓存输入 / 输出）
+function creditSplitCell(r){
+  const sp = r.credit_split;
+  if(r.error || !sp) return '<span style="color:var(--dim)">—</span>';
+  const fmtPart = v => {
+    const n = Number(v || 0);
+    if(!n) return '<span style="color:var(--dim)">0</span>';
+    return n >= 100 ? n.toFixed(0) : (n >= 1 ? n.toFixed(1) : n.toFixed(2));
+  };
+  const total = Number(sp.input || 0) + Number(sp.cached || 0) + Number(sp.output || 0);
+  // 缓存字段缺失时缓存段标 ?，避免把「没有数据」读成「零命中」
+  const cachedKnown = r.cached_reported !== false;
+  const cacheTxt = cachedKnown ? fmtPart(sp.cached)
+    : '<span style="color:var(--dim)" title="上游没有回报缓存字段，缓存段无法折算">?</span>';
+  const nominal = (r.billable === false);
+  const style = nominal ? 'opacity:.62;font-style:italic' : '';
+  return '<span style="' + style + '" title="' + esc(
+      (nominal ? '名义成本（上游标记为不计费）' : '实际扣费') +
+      '：非缓存输入 ' + (sp.input || 0) + ' + 缓存输入 ' + (sp.cached || 0) +
+      ' + 输出 ' + (sp.output || 0) + ' = ' + total.toFixed(2) + ' 积分') + '">'
+    + '<span style="color:#e08b2b">' + fmtPart(sp.input) + '</span>'
+    + '<span style="color:var(--dim)">+</span>' + '<span style="color:#26bb82">' + cacheTxt + '</span>'
+    + '<span style="color:var(--dim)">+</span>' + '<span style="color:var(--think)">' + fmtPart(sp.output) + '</span>'
+    + (nominal ? '<span style="font-size:9px;color:var(--dim);margin-left:3px">名义</span>' : '')
+    + '</span>';
+}
 // issue #129：每次调用的积分消耗可视化
 function creditCell(r){
   if(r.error) return '<span style="color:var(--dim)">—</span>';
@@ -4873,8 +4899,23 @@ function recentCreditSummary(rows){
   const disc = sumOrig > sum + 1e-9
     ? '（原价 <span style="text-decoration:line-through">' + sumOrig.toFixed(2) + '</span>）'
     : '';
+  // issue #129 后续：合计也按三段拆开，整页成本落在哪一段一目了然
+  let part = { input: 0, cached: 0, output: 0 };
+  (rows || []).forEach(function(r){
+    const sp = r.credit_split;
+    if(!sp) return;
+    part.input += Number(sp.input || 0);
+    part.cached += Number(sp.cached || 0);
+    part.output += Number(sp.output || 0);
+  });
+  const splitTxt = '<span style="color:#e08b2b">输入 ' + part.input.toFixed(1) + '</span>'
+    + ' <span style="color:var(--dim)">+</span> '
+    + '<span style="color:#26bb82">缓存 ' + part.cached.toFixed(1) + '</span>'
+    + ' <span style="color:var(--dim)">+</span> '
+    + '<span style="color:var(--think)">输出 ' + part.output.toFixed(1) + '</span>';
   return '<div class="legend" style="margin-top:6px"><span>本页 ' + n + ' 次调用合计 '
     + '<b style="color:var(--accent2)">' + sum.toFixed(2) + '</b> 积分' + disc
+    + '（拆分：' + splitTxt + '）'
     + '；单次扣费按积分列（鼠标悬停看明细）</span></div>';
 }
 
@@ -4959,7 +5000,7 @@ async function refreshInner(){
   const countEl = document.getElementById('recentCount');
   if(countEl) countEl.textContent = '(第 ' + RECENT_PAGE + ' 页 / 共 ' + fmt(total) + ' 条)';
   document.getElementById('recent').innerHTML = rows.length ?
-    '<table><thead><tr><th>时间</th><th>模型</th><th>账号</th><th style="text-align:left">Key</th><th style="text-align:left">档位</th><th style="text-align:center;width:72px">区域</th><th>模式</th><th>耗时</th><th>首字</th><th>速度</th><th>输入</th><th>输出</th><th>思考</th><th>缓存</th><th>总 token</th><th style="text-align:right;width:84px">积分</th></tr></thead><tbody>'
+    '<table><thead><tr><th>时间</th><th>模型</th><th>账号</th><th style="text-align:left">Key</th><th style="text-align:left">档位</th><th style="text-align:center;width:72px">区域</th><th>模式</th><th>耗时</th><th>首字</th><th>速度</th><th>输入</th><th>输出</th><th>思考</th><th>缓存</th><th>总 token</th><th style="text-align:right;width:84px">积分</th><th style="text-align:right;width:150px" title="按 token 折算的三段贡献：非缓存输入 + 缓存输入 + 输出；斜体「名义」表示上游标记为不计费">积分拆分</th></tr></thead><tbody>'
     + rows.map(r => '<tr>'
         + '<td class="mono">' + esc((r.iso||'').replace('T',' ').slice(5)) + '</td>'
         + '<td class="mono">' + esc(r.model)
@@ -4978,6 +5019,7 @@ async function refreshInner(){
         + '<td>' + (r.cache_hit_pct!=null ? r.cache_hit_pct+'%' : '—') + '</td>'
         + '<td><b>' + fmt(r.total_tokens) + '</b></td>'
         + '<td style="text-align:right" title="' + esc(creditTitle(r)) + '">' + creditCell(r) + '</td>'
+        + '<td style="text-align:right;white-space:nowrap;font-size:11px">' + creditSplitCell(r) + '</td>'
       + '</tr>').join('') + '</tbody></table>'
       + recentCreditSummary(rows)
     : '<div class="empty">还没有请求记录</div>';
