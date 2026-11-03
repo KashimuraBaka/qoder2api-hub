@@ -1916,6 +1916,10 @@ window.initLangSystem();
     <div class="insight-grid" id="insightCards"></div>
 
     <div class="insight-block">
+      <h2>全价请求 <em id="fullPriceHint"></em></h2>
+      <div id="fullPriceWrap"></div>
+    </div>
+    <div class="insight-block">
       <h2>官方积分消耗 <em id="creditUsageHint"></em></h2>
       <div id="creditUsageWrap"></div>
     </div>
@@ -3339,6 +3343,31 @@ let INSIGHT_SIG = "";
 // 官方积分消耗（0.4.3 客户端新增接口 /accounts/credits/usage）：累计 + 峰值日 + 365 天热力图
 let CREDIT_USAGE_SIG = "";
 let CREDIT_USAGE_AT = 0;
+// issue #129 后续：把「缓存为 0 的超长 prompt」单独拎出来 —— 它是最容易被忽略的成本项
+function renderFullPrice(fp){
+  const box = document.getElementById("fullPriceWrap");
+  const hint = document.getElementById("fullPriceHint");
+  if(!box) return;
+  const n = Number((fp && fp.requests) || 0);
+  const credit = Number((fp && fp.credit) || 0);
+  const share = (fp && fp.credit_share != null) ? fp.credit_share : null;
+  const th = (fp && fp.threshold) || 100000;
+  if(hint){
+    hint.textContent = n ? ("（" + n + " 次）") : "（无）";
+  }
+  if(!n){
+    box.innerHTML = '<div class="empty">当前窗口没有「缓存为 0 的超长请求」——前缀复用良好</div>';
+    return;
+  }
+  const pct = share == null ? "—" : (share + "%");
+  box.innerHTML = '<div class="insight-hero" style="margin-bottom:10px">'
+    + '<div><div style="font-size:26px;font-weight:800;color:#e08b2b">' + n + '<span style="font-size:13px;font-weight:600;color:var(--dim)"> 次</span></div>'
+    + '<div style="font-size:11px;color:var(--dim);margin-top:2px">输入 ≥ ' + fmt(th) + ' 且缓存命中为 0</div></div>'
+    + '<div style="text-align:right"><div style="font-size:18px;font-weight:700;color:var(--accent2)">' + credit.toFixed(2) + ' 积分</div>'
+    + '<div style="font-size:11px;color:var(--dim);margin-top:2px">占窗口积分 ' + pct + '</div></div></div>'
+    + '<div class="legend"><span>这类请求按<b>全价</b>计费：换前缀（改系统提示/工具清单）、新开会话、或压缩历史后首轮最容易命中。'
+    + '想降成本就保持前缀稳定，并让长会话走压缩而不是重开。</span></div>';
+}
 async function loadCreditUsage(force){
   if(!force && Date.now() - CREDIT_USAGE_AT < 60000) return;
   CREDIT_USAGE_AT = Date.now();
@@ -6966,6 +6995,8 @@ async function loadAnalytics(force){
     }
   }catch(e){ /* 样本取不到不影响主看板 */ }
   loadQuality();
+  try{ renderFullPrice(statData && statData.full_price); }
+  catch(e){ /* 全价请求卡失败不影响主看板 */ }
   try{ loadCreditUsage(!!force); }catch(e){ /* 官方积分消耗失败不影响主看板 */ }
 }
 

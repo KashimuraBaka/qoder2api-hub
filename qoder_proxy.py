@@ -64,7 +64,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.7.20"
+VERSION = "1.7.21"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -1884,6 +1884,10 @@ def _day_key(ts):
         return ""
 
 
+# issue #129 后续：多少 prompt token 以上、且缓存为 0，算「全价请求」
+FULL_PRICE_PROMPT_MIN = int(os.environ.get("QD_FULL_PRICE_PROMPT_MIN") or 100000)
+
+
 def compute_usage_stats(range=None, since=None, until=None,
                         heatmap_days=365, top_n=5):
     """统计概览页所需的全部数据（单次扫描 usage.jsonl）。
@@ -1898,6 +1902,11 @@ def compute_usage_stats(range=None, since=None, until=None,
 
     tot = {"requests": 0, "errors": 0, "tokens": 0,
            "prompt": 0, "completion": 0, "cached": 0}
+    # issue #129 后续：报告者按小时拟合出的最大成本项是「缓存为 0 的超长 prompt」
+    # （一天里 9 次这类请求就占了 30% 积分）。这里把这类请求单独计数并统计积分占比，
+    # 让用户能直接看到「换前缀 / 新开会话」的代价。
+    full_price = {"requests": 0, "prompt": 0, "credit": 0.0}
+    total_credit = 0.0
     models = {}       # model -> {"tokens","requests"}
     accounts = {}     # account -> {"tokens","requests"}
     providers = {}    # provider -> {"tokens","requests"}
@@ -1967,6 +1976,16 @@ def compute_usage_stats(range=None, since=None, until=None,
                     tot["prompt"] += prompt
                     tot["completion"] += int(r.get("completion_tokens") or 0)
                     tot["cached"] += cached
+                    _credit = r.get("credit") or 0
+                    try:
+                        _credit = float(_credit)
+                    except (TypeError, ValueError):
+                        _credit = 0.0
+                    total_credit += _credit
+                    if prompt >= FULL_PRICE_PROMPT_MIN and cached <= 0:
+                        full_price["requests"] += 1
+                        full_price["prompt"] += prompt
+                        full_price["credit"] += _credit
                     m = r.get("model") or "(unknown)"
                     _bump(models, m, tokens)
                     _bump(accounts, r.get("account") or "(unattributed)", tokens)
@@ -2057,6 +2076,14 @@ def compute_usage_stats(range=None, since=None, until=None,
         "models": _rank(models, 10),
         "providers": _rank(providers, 10),
         "cache": {"windows": cache_rows},
+        "full_price": {
+            "requests": full_price["requests"],
+            "prompt": full_price["prompt"],
+            "credit": round(full_price["credit"], 2),
+            "credit_share": (round(full_price["credit"] * 100.0 / total_credit, 1)
+                             if total_credit > 0 else None),
+            "threshold": FULL_PRICE_PROMPT_MIN,
+        },
         "hourly": {"points": hours},
         "heatmap": {"days": heat_days,
                      "max": max([d["tokens"] for d in heat_days] or [0])},
